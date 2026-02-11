@@ -12,6 +12,7 @@ from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.multimodal_gen.runtime.layers.triton_ops import triton_apply_rope_partial_in_place
 
 global _use_multi_stream
 _is_cuda = is_cuda()
@@ -1180,16 +1181,20 @@ class Indexer(MultiPlatformOp):
             q_lora = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
             q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
             q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
-            q_pe, q_nope = torch.split(
-                q,
-                [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                dim=-1,
-            )  # [bs, 64, 64 + 64]
-            q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-            q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
-                bs, self.n_heads, self.rope_head_dim
-            )  # [bs, n, d]
-            q = torch.cat([q_pe, q_nope], dim=-1)
+            if is_prefill:
+                q_pe, q_nope = torch.split(
+                    q,
+                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                    dim=-1,
+                )  # [bs, 64, 64 + 64]
+                q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
+                q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
+                    bs, self.n_heads, self.rope_head_dim
+                )  # [bs, n, d]
+                q = torch.cat([q_pe, q_nope], dim=-1)
+            else:
+                q  = triton_apply_rope_partial_in_place(q, sin, cos)
+
 
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             indexer_weight_stream = get_indexer_weight_stream()

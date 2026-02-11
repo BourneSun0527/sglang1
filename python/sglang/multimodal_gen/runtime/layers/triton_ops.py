@@ -1178,6 +1178,69 @@ def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
         )
     return y
 
+def triton_apply_rope_partial_in_place(x, sin, cos):
+    rope_dim = sin.shape[-1]
+    org_shape = x.shape
+    if x.dim() == 2:
+        bsz, hidden_size = x.shape
+        head_num = 1
+    elif x.dim() == 3:
+        bsz, head_num, hidden_size = x.shape
+        x = x.view(-1, hidden_size)
+    else:
+        raise NotImplementedError(f"x_shape={x.shape} not supported")
+    cores = bsz * head_num
+    assert cores < 65535
+    triton_rope_kernel_in_place[(cores,)](
+        x,
+        sin,
+        cos,
+        x.stride(0),
+        sin.stride(0),
+        hidden_size,
+        rope_dim,
+        head_num,
+    )
+    return x.view(org_shape)
+
+@triton.jit
+def triton_rope_kernel_in_place(
+    x_ptr,
+    sin_ptr,
+    cos_ptr,
+    x_stride,
+    cos_stride,
+    hidden_size: tl.constexpr,
+    rope_dim: tl.constexpr,
+    head_num: tl.constexpr,
+):
+    cur_b = tl.program_id(0)
+    # load x
+    offset_x = cur_b * x_stride + tl.arange(0, rope_dim)
+    x = tl.load(x_ptr + offset_x).to(tl.float32)
+    # load sin cos
+    offset_sin_cos = cur_b // head_num * cos_stride + tl.arange(0, rope_dim)
+    sin = tl.load(sin_ptr + offset_sin_cos).to(tl.float32)
+    cos = tl.load(cos_ptr + offset_sin_cos).to(tl.float32)
+
+    even = tl.extract_slice(
+        x, offsets=[0], sizes=[rope_dim // 2], strides=[1]
+    )
+    odd = tl.extract_slice(
+        x, offsets=[rope_dim // 2], sizes=[rope_dim // 2], strides=[1]
+    )
+    odd = -odd
+
+    x_rotate = tl.zeros([rope_dim], dtype=tl.float32)
+    x_rotate = tl.insert_slice(
+        x_rotate, odd, offsets=[0], sizes=[rope_dim // 2], strides=[1]
+    )
+    x_rotate = tl.insert_slice(
+        x_rotate, even, offsets=[rope_dim // 2], sizes=[rope_dim // 2], strides=[1]
+    )
+
+    out = x * cos + x_rotate * sin
+    tl.store(x_ptr + offset_x, out.to(tl.bfloat16))
 
 if current_platform.is_npu():
     # TODO: remove this when triton ascend bug is fixed
