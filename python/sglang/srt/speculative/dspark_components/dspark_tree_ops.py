@@ -1113,7 +1113,9 @@ def _node_commit_kernels():
     return _NODE_COMMIT_KERNELS
 
 
-def prepare_nodes(plan: NodePlan, records: list[NodeRecord], winners, active, device):
+def _prepare_nodes_legacy(
+    plan: NodePlan, records: list[NodeRecord], winners, active, device
+):
     """Freeze accepted node rows into staging before touching the live cache."""
     winners = globalize_winners(plan, winners)
     freeze_node_pages, _ = _node_commit_kernels()
@@ -1150,12 +1152,153 @@ def prepare_nodes(plan: NodePlan, records: list[NodeRecord], winners, active, de
     return desc, staging, enabled, max_rows
 
 
-def commit_nodes(prepared) -> None:
+def _commit_nodes_legacy(prepared) -> None:
     """Scatter the frozen staging rows into the live compressed cache pages."""
     _, commit_node_pages = _node_commit_kernels()
     desc, staging, enabled, max_rows = prepared
     if desc.shape[0]:
         commit_node_pages[(len(desc), max_rows)](desc, staging, enabled, 256)
+
+
+_SPARSE_NODE_COMMIT_KERNELS = None
+
+
+def _sparse_node_commit_kernels():
+    """Select rows once, then copy only changed rows in parallel byte tiles."""
+    global _SPARSE_NODE_COMMIT_KERNELS, tl
+    if _SPARSE_NODE_COMMIT_KERNELS is not None:
+        return _SPARSE_NODE_COMMIT_KERNELS
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def select_node_rows(
+        Desc, Ancestors, Depths, Starts, Req, Winners, Active, Selected,
+        N: tl.constexpr, MAX_Q: tl.constexpr, ROWS: tl.constexpr, BN: tl.constexpr,
+    ):
+        job = tl.program_id(0)
+        row = tl.program_id(1)
+        d = Desc + job * 10
+        rows = tl.load(d + 3)
+        table = tl.load(d + 5).to(tl.pointer_type(tl.int32))
+        width = tl.load(d + 6)
+        page_id = tl.load(d + 7)
+        ratio = tl.load(d + 9)
+        node = tl.arange(0, BN)
+        valid = node < N
+        req = tl.load(Req + node, valid, other=0)
+        winner = tl.load(Winners + req)
+        depth = tl.load(Depths + node, valid, other=0)
+        win_depth = tl.load(Depths + winner)
+        # Clamp padding/future depths before forming an ancestor address.
+        ancestor_ok = valid & (depth >= 0) & (depth < MAX_Q) & (depth <= win_depth)
+        safe_depth = tl.where(ancestor_ok, depth, 0)
+        ancestor = tl.load(
+            Ancestors + winner * MAX_Q + safe_depth, ancestor_ok, other=-1
+        )
+        selected = ancestor_ok & (ancestor == node) & tl.load(Active + req)
+        pos = tl.load(Starts + node, valid, other=0) + depth
+        selected = selected & ((pos + 1) % ratio == 0)
+        position = (pos + 1) // ratio - 1
+        col = position // rows
+        col_ok = valid & (col >= 0) & (col < width)
+        safe_col = tl.where(col_ok, col, 0)
+        page = tl.load(table + req * width + safe_col, col_ok, other=-1)
+        matches = (
+            selected
+            & col_ok
+            & (page == page_id)
+            & (position % rows == row)
+            & (row < rows)
+        )
+        # Preserve legacy priority: first request, then latest accepted depth,
+        # then largest node id for an exact priority tie.
+        priority = tl.where(matches, (N - req) * (MAX_Q + 1) + depth, -1)
+        best = tl.max(priority, 0)
+        chosen = tl.max(tl.where(matches & (priority == best), node, -1), 0)
+        tl.store(Selected + job * ROWS + row, chosen)
+
+    @triton.jit
+    def freeze_node_rows(
+        Desc, Selected, Staging, ROWS: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        job = tl.program_id(0)
+        row = tl.program_id(1)
+        tile = tl.program_id(2)
+        chosen = tl.load(Selected + job * ROWS + row)
+        d = Desc + job * 10
+        size = tl.load(d + 2)
+        if chosen >= 0 and tile * BLOCK < size:
+            nodes = tl.load(d + 4).to(tl.pointer_type(tl.uint8))
+            stage_offset = tl.load(d + 8)
+            offset = tile * BLOCK + tl.arange(0, BLOCK)
+            value = tl.load(nodes + chosen * size + offset, offset < size, other=0)
+            tl.store(Staging + stage_offset + row * size + offset, value, offset < size)
+
+    @triton.jit
+    def commit_node_rows(
+        Desc, Selected, Staging, ROWS: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        job = tl.program_id(0)
+        row = tl.program_id(1)
+        tile = tl.program_id(2)
+        chosen = tl.load(Selected + job * ROWS + row)
+        d = Desc + job * 10
+        size = tl.load(d + 2)
+        if chosen >= 0 and tile * BLOCK < size:
+            target = tl.load(d).to(tl.pointer_type(tl.uint8))
+            stride = tl.load(d + 1)
+            stage_offset = tl.load(d + 8)
+            offset = tile * BLOCK + tl.arange(0, BLOCK)
+            value = tl.load(
+                Staging + stage_offset + row * size + offset, offset < size, other=0
+            )
+            tl.store(target + row * stride + offset, value, offset < size)
+
+    _SPARSE_NODE_COMMIT_KERNELS = (select_node_rows, freeze_node_rows, commit_node_rows)
+    return _SPARSE_NODE_COMMIT_KERNELS
+
+
+def prepare_nodes(plan: NodePlan, records: list[NodeRecord], winners, active, device):
+    """Snapshot changed rows before any writes, including aliased node sources.
+
+    Set SGLANG_DSPARK_NODE_COMMIT_MODE=legacy for the original full-page path.
+    The sparse path retains page-sized staging offsets but leaves untouched rows
+    uninitialised; commit_node_rows must use the same selection mask.
+    """
+    mode = os.environ.get("SGLANG_DSPARK_NODE_COMMIT_MODE", "sparse").strip().lower()
+    if mode == "legacy":
+        return ("legacy", _prepare_nodes_legacy(plan, records, winners, active, device))
+    if mode != "sparse":
+        raise ValueError("SGLANG_DSPARK_NODE_COMMIT_MODE must be sparse or legacy")
+    descriptors, total, max_rows = build_node_descriptors(records)
+    if not descriptors:
+        return ("sparse", None)
+    select_rows, freeze_rows, _ = _sparse_node_commit_kernels()
+    winners = globalize_winners(plan, winners)
+    desc = torch.tensor(descriptors, dtype=torch.int64, device=device)
+    staging = torch.empty(total, dtype=torch.uint8, device=device)
+    selected = torch.empty((len(descriptors), max_rows), dtype=torch.int32, device=device)
+    bn = 1 << max(int(plan.n) - 1, 0).bit_length()
+    select_rows[(len(descriptors), max_rows)](
+        desc, plan.ancestors, plan.depths, plan.start, plan.req_ids, winners,
+        active, selected, plan.n, int(plan.ancestors.shape[1]), max_rows, bn,
+    )
+    block = 4096
+    tiles = (max(d[2] for d in descriptors) + block - 1) // block
+    grid = (len(descriptors), max_rows, tiles)
+    freeze_rows[grid](desc, selected, staging, max_rows, block)
+    return ("sparse", (desc, staging, selected, max_rows, grid, block))
+
+
+def commit_nodes(prepared) -> None:
+    mode, payload = prepared
+    if mode == "legacy":
+        _commit_nodes_legacy(payload)
+    elif payload is not None:
+        _, _, commit_rows = _sparse_node_commit_kernels()
+        desc, staging, selected, max_rows, grid, block = payload
+        commit_rows[grid](desc, selected, staging, max_rows, block)
 
 
 # ---------------------------------------------------------------------------
