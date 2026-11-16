@@ -1294,6 +1294,20 @@ class EngramEmbedding(nn.Module):
                 mxfp4=self.mxfp4,
             )
             return out
+        parallel = get_parallel()
+        if parallel.attn_cp_size > 1 and parallel.attn_dp_size > 1:
+            # CP shards hold different tokens, and each DP group holds different
+            # requests. Gather all their indices before reducing TP-sharded
+            # table rows. Idle/non-CP peers must enter the same collectives.
+            cp_shard_counts = None
+            if cp_all_tokens:
+                metadata = forward_batch.attn_cp_metadata
+                cp_shard_counts = (
+                    metadata.per_rank_logical_token or metadata.per_rank_actual_token
+                )
+            return self._dp_global_buffer_lookup(
+                indices, forward_batch, cp_shard_counts=cp_shard_counts
+            )
         if cp_all_tokens and self.tp_size > 1:
             # Prefill CP: gather the hash ids over the CP group first so every
             # TP rank looks up the same indices, then keep this rank's slice.
@@ -1501,7 +1515,11 @@ class EngramEmbedding(nn.Module):
         return list(sizes)
 
     def _dp_global_buffer_lookup(
-        self, indices: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        indices: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        cp_shard_counts=None,
     ) -> torch.Tensor:
         """Look up every DP rank's indices in the global DP buffer and reduce them."""
         rows = get_global_dp_buffer_len()
@@ -1509,7 +1527,9 @@ class EngramEmbedding(nn.Module):
             (rows, *indices.shape[1:]), dtype=indices.dtype, device=indices.device
         )
         # The MAX_LEN gather may zero its local input in place, hence the clone.
-        dp_gather_replicate(ids_global, indices.clone(), forward_batch)
+        dp_gather_replicate(
+            ids_global, indices.clone(), forward_batch, cp_shard_counts=cp_shard_counts
+        )
         if rows == 0:
             return self.new_rows(indices)
         values = self._owned_rows(ids_global).view(rows, -1)
@@ -1519,7 +1539,16 @@ class EngramEmbedding(nn.Module):
             device=values.device,
         )
         padding = forward_batch.dp_padding_mode
-        if (
+        if get_parallel().attn_cp_size > 1:
+            # CP prefill shards and replicated decode rows use different local
+            # slices, but must share the full-TP reduction on every DP rank.
+            dp_scatter(
+                local,
+                self._reduce_owned_rows(values),
+                forward_batch,
+                cp_shard_counts=cp_shard_counts,
+            )
+        elif (
             padding is not None
             and padding.is_max_len()
             and self.tp_size == get_parallel().attn_dp_size

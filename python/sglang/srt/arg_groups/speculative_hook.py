@@ -702,7 +702,15 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                     "DSpark DP MoE or prefill coordination requires "
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
-        if cfg.attn_cp_size > 1:
+        npu_v41_cp = (
+            _is_npu
+            and model_config_of(server_args).hf_config.model_type == "deepseek_v41"
+            and cfg.enable_prefill_cp
+            and cfg.cp_strategy == "interleave"
+            and cfg.disaggregation_mode == "null"
+            and cfg.nnodes == 1
+        )
+        if cfg.attn_cp_size > 1 and not npu_v41_cp:
             raise ValueError(
                 "DSpark with dp attention does not support context parallel "
                 f"(attn_cp_size={cfg.attn_cp_size})."

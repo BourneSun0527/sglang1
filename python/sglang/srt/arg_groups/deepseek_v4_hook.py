@@ -257,6 +257,23 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             "DeepSeekV4 zigzag CP requires the NPU backend; CUDA/HIP backends "
             "reindex with interleave order."
         )
+    if is_npu() and model_config_of(server_args).hf_config.model_type == "deepseek_v41":
+        # The initial A3 path keeps replicated caches for colocated decode and
+        # uses eager prefill. PD state handoff and prefix reuse are separate.
+        if (
+            cfg.cp_strategy != "interleave"
+            or cfg.nnodes != 1
+            or cfg.disaggregation_mode != "null"
+            or not cfg.disable_radix_cache
+            or cfg.dcp_size != 1
+            or cfg.enable_cp_decode_attn_tp
+            or cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+        ):
+            raise ValueError(
+                "DeepSeek-V4.1 prefill CP on NPU currently requires single-node "
+                "colocated serving, interleave, --disable-radix-cache, DCP=1, "
+                "disabled prefill graphs and no --enable-cp-decode-attn-tp."
+            )
     if get_platform().is_hip:
         prefill_backend, decode_backend = attention_backends_of(
             resolved_view(server_args)
