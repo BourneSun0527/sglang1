@@ -1296,6 +1296,28 @@ class EngramEmbedding(nn.Module):
             return out
         parallel = get_parallel()
         if parallel.attn_cp_size > 1 and parallel.attn_dp_size > 1:
+            if forward_batch.is_extend_in_batch:
+                # CP and DP padding need not describe the same physical rows.
+                # Exchange actual rank-local shapes on eager prefill, including
+                # idle peers, rather than indexing a DP scratch buffer with CP
+                # counts. Decode retains its graph-safe fixed-buffer path.
+                group = parallel.tp_group
+                sizes = [None] * self.tp_size
+                torch.distributed.all_gather_object(
+                    sizes, indices.shape[0], group=group.cpu_group
+                )
+                if sum(sizes) == 0:
+                    return self.new_rows(indices)
+                # Use fixed-size HCCL collectives; GroupCoordinator.all_gatherv
+                # requires the CUDA PyNccl communicator.
+                rows = max(sizes)
+                padded = indices.new_zeros((rows, *indices.shape[1:]))
+                padded[: indices.shape[0]].copy_(indices)
+                ids = indices.new_empty((self.tp_size * rows, *indices.shape[1:]))
+                group.all_gather_into_tensor(ids, padded)
+                values = self._lookup(ids)
+                start = rows * parallel.tp_rank
+                return values[start : start + sizes[parallel.tp_rank]].contiguous()
             # CP shards hold different tokens, and each DP group holds different
             # requests. Gather all their indices before reducing TP-sharded
             # table rows. Idle/non-CP peers must enter the same collectives.
