@@ -97,7 +97,7 @@ class NPUSwigluDeepEPKernel(BaseActivation):
 
             self._kernel = swiglu_oai_quant
         else:
-            from sgl_kernel_npu.operators.activation import swiglu_quant
+            from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
 
             self._kernel = swiglu_quant
 
