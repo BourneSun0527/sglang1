@@ -21,10 +21,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch_npu
-from sgl_kernel_npu.operators.mem_cache import (
-    kv_compress_epilog,
-    kv_compress_epilog_v2,
-)
+from sgl_kernel_npu.operators.mem_cache import kv_compress_epilog
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
@@ -917,6 +914,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         if cache_2d.shape[0] == 0:
             return
         quant_mode, quant_group_size = layout.quant
+        from sgl_kernel_npu.operators.mem_cache import kv_compress_epilog_v2
+
         kv_compress_epilog_v2(
             buf.view(-1, buf.shape[-1]),
             cache_2d,

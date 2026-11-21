@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
-from sgl_kernel_npu.operators.attention import attention_sinks, attention_sinks_prefill
+from sgl_kernel_npu.operators import attention as npu_attention_ops
 
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
@@ -2572,7 +2572,7 @@ class AscendAttnBackend(AttentionBackend):
                         )
 
                 else:
-                    attn_out = attention_sinks_prefill(
+                    attn_out = npu_attention_ops.attention_sinks_prefill(
                         q,
                         k_cache,
                         v_cache,
@@ -3962,7 +3962,7 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                attn_out = attention_sinks(
+                attn_out = npu_attention_ops.attention_sinks(
                     q,
                     k_cache,
                     v_cache,
@@ -4370,7 +4370,7 @@ class AscendAttnBackend(AttentionBackend):
                     )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 else:
-                    attn_out = attention_sinks(
+                    attn_out = npu_attention_ops.attention_sinks(
                         q,
                         k_cache,
                         v_cache,

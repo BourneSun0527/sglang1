@@ -91,9 +91,16 @@ def div_argmax(
         and divisor.stride(1) == 1
     )
     if _is_npu:
-        from sgl_kernel_npu.operators.sample import div_argmax as npu_div_argmax
+        from sgl_kernel_npu.operators import sample
 
-        return npu_div_argmax(
+        if not hasattr(sample, "div_argmax"):
+            if divisor_min is not None:
+                divisor = divisor.clamp_min(divisor_min)
+            quotient = x / divisor
+            if ignore_nan:
+                quotient.masked_fill_(quotient.isnan(), float("-inf"))
+            return quotient.argmax(dim=-1)
+        return sample.div_argmax(
             x, divisor, divisor_min=divisor_min, ignore_nan=ignore_nan
         )
     return _medium_row_argmax(

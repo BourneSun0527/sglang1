@@ -504,9 +504,11 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 device=k_buffer_layer.device, non_blocking=True
             )
         self._debug_prefix_valid_backend = "npu_triton"
-        from sgl_kernel_npu.operators.mem_cache import store_kv_cache_prefix_valid
+        from sgl_kernel_npu.mem_cache.kv_cache_store import (
+            store_kv_cache_prefix_valid_npu_triton,
+        )
 
-        store_kv_cache_prefix_valid(
+        store_kv_cache_prefix_valid_npu_triton(
             k_buffer_layer.view(-1, self.head_num, self.head_dim),
             v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
             cache_k.reshape(num_rows, self.head_num, self.head_dim),
