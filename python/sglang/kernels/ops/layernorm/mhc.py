@@ -2137,6 +2137,21 @@ def npu_hc_pre(
         )
         return y, post, comb, False
 
+    if envs.SGLANG_NPU_USE_RECIPES_HC_PRE.get():
+        import custom_ops  # noqa: F401  (registers torch.ops.custom.npu_hc_pre)
+
+        y, post, comb = torch.ops.custom.npu_hc_pre(
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            hc_mult=hc_mult,
+            hc_sinkhorn_iters=hc_sinkhorn_iters,
+            norm_eps=rms_norm_eps,
+            hc_eps=hc_eps,
+        )
+        return y.to(dtype), post, comb, False
+
     from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
 
     y, post, comb = mhc_pre_dpskv4(
