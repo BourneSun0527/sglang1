@@ -761,6 +761,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         return {name: tails.get(name, max(seq_len, 0)) for name in names}
 
+    def _projected_window_tokens(self, req: Req, fill_len: int) -> Dict[str, int]:
+        max_new = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+        tails = self._window_tails(fill_len)
+        projected = {name: tail + max_new for name, tail in tails.items()}
+        if self._uses_swa_tail_prealloc() and self.tree_cache.supports_swa():
+            from sglang.srt.model_executor.pool_configurator import swa_decode_headroom
+
+            page_size = self.token_to_kv_pool_allocator.page_size
+            headroom = swa_decode_headroom(page_size)
+            for name, window in self.tree_cache.window_lengths():
+                if name in projected and window is not None and window > 0:
+                    # Decode radix insertion can pin the incoming tail while
+                    # another window advances at the generation frontier.
+                    pinned = (
+                        ceil_align(tails[name], page_size)
+                        if self._keep_insert_boundary()
+                        else 0
+                    )
+                    peak = pinned + ceil_align(window + headroom, page_size)
+                    projected[name] = min(projected[name], peak)
+        return projected
+
     def _prealloc_demand(
         self,
         req: Req,
@@ -801,7 +823,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.token_to_kv_pool_allocator.window_pool_names(), held
             )
         return {
-            name: tail + len(req.output_ids)
+            name: min(
+                tail + len(req.output_ids),
+                kv_private_window_tokens(
+                    req.kv, self.token_to_kv_pool_allocator.page_size, name
+                ),
+            )
             for name, tail in self._window_tails(len(req.origin_input_ids)).items()
         }
 
@@ -1870,18 +1897,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             window_admission_tokens = None
             if uses_swa_tail_prealloc:
                 _, window_required = self._prealloc_required(decode_req.req)
-                window_lens = self._window_tails(pre_alloc_fill_len(decode_req.req))
-                max_new_tokens = min(
-                    decode_req.req.sampling_params.max_new_tokens,
-                    CLIP_MAX_NEW_TOKEN,
+                projected = self._projected_window_tokens(
+                    decode_req.req, pre_alloc_fill_len(decode_req.req)
                 )
-                # Each window grows by the request's decode until it is full,
-                # as the scheduler's window budgets price it.
                 window_admission_tokens = {
                     name: max(
                         required,
-                        window_lens[name]
-                        + max_new_tokens
+                        projected[name]
                         - (retractable_window_tokens or {}).get(name, 0),
                     )
                     for name, required in window_required.items()
@@ -2875,12 +2897,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if stats is None or stats.max_window_req_tokens is None:
                 max_window_req_tokens = {}
                 for x in running:
-                    max_new = min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
-                    tails = self._window_tails(len(x.origin_input_ids))
-                    for name, tail in tails.items():
+                    projected = self._projected_window_tokens(
+                        x, len(x.origin_input_ids)
+                    )
+                    for name, tokens in projected.items():
                         max_window_req_tokens[name] = max(
-                            max_window_req_tokens.get(name, tail + max_new),
-                            tail + max_new,
+                            max_window_req_tokens.get(name, 0), tokens
                         )
                 if stats is not None:
                     stats.max_window_req_tokens = max_window_req_tokens

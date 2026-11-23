@@ -1092,20 +1092,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
-def compute_swa_request_cap(
-    *,
-    page_size: int,
-    window: int,
-    attn_dp_size: int,
-    max_running_requests: int | None = None,
-) -> int:
-    """Worst-case SWA slots the scheduler holds live at max_running_requests."""
+def swa_decode_headroom(page_size: int) -> int:
+    """Per-request window slots for delayed eviction, page alignment and decode."""
     draft_tokens = get_spec().speculative_num_draft_tokens or 1
     eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
 
     # __________[padding][eviction_interval][window]
     # Padding to make sure eviction point is page-aligned.
-    trailing_tokens = window + eviction_interval * draft_tokens + page_size
+    trailing_tokens = eviction_interval * draft_tokens + page_size
     if get_spec().speculative_algorithm is None:
         decode_alloc = page_size
     elif get_schedule().disable_overlap_schedule:
@@ -1120,7 +1114,18 @@ def compute_swa_request_cap(
         # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
         # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
         decode_alloc = 2 * get_alloc_len_per_decode()
-    per_request = trailing_tokens + decode_alloc
+    return trailing_tokens + decode_alloc
+
+
+def compute_swa_request_cap(
+    *,
+    page_size: int,
+    window: int,
+    attn_dp_size: int,
+    max_running_requests: int | None = None,
+) -> int:
+    """Worst-case SWA slots the scheduler holds live at max_running_requests."""
+    per_request = window + swa_decode_headroom(page_size)
 
     if max_running_requests is None:
         max_running_requests = get_schedule().max_running_requests
