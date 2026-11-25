@@ -28,6 +28,18 @@ git -C "$work" fetch --depth=1 origin "$rev"
 git -C "$work" checkout -q --detach FETCH_HEAD
 if [[ $component == vendor ]]; then
     git -C "$work" submodule update --init --recursive
+    # The experimental build compiles opbase tiling from source. CANN 9.2
+    # also ships op_common headers, with different C++ member signatures.
+    cat >> "$work/CMakeLists.txt" <<'CMAKE'
+
+if(TARGET opbase_tiling_objs)
+    set(qli_opbase_include "${OPBASE_SOURCE_PATH}/pkg_inc")
+    if(NOT EXISTS "${qli_opbase_include}/op_common/atvoss/elewise/elewise_tiling.h")
+        message(FATAL_ERROR "Missing source-matched opbase tiling headers: ${qli_opbase_include}")
+    endif()
+    target_include_directories(opbase_tiling_objs BEFORE PRIVATE "${qli_opbase_include}")
+endif()
+CMAKE
     dest=$(realpath -m "${QLI_INSTALL_ROOT:-$PWD/qli91-opp}")
     ( cd "$work" && bash build.sh --pkg --experimental --soc=ascend910_93 \
         --vendor_name=sgl_legacy_qli --ops=quant_lightning_indexer,quant_lightning_indexer_metadata "-j$jobs" )
