@@ -30,15 +30,19 @@ if [[ $component == vendor ]]; then
     git -C "$work" submodule update --init --recursive
     # The experimental build compiles opbase tiling from source. CANN 9.2
     # also ships op_common headers, with different C++ member signatures.
-    cat >> "$work/CMakeLists.txt" <<'CMAKE'
+    qli_host="$work/experimental/attention/quant_lightning_indexer/op_host/CMakeLists.txt"
+    test -f "$qli_host"
+    cat >> "$qli_host" <<'CMAKE'
 
-if(TARGET opbase_tiling_objs)
-    set(qli_opbase_include "${OPBASE_SOURCE_PATH}/pkg_inc")
-    if(NOT EXISTS "${qli_opbase_include}/op_common/atvoss/elewise/elewise_tiling.h")
-        message(FATAL_ERROR "Missing source-matched opbase tiling headers: ${qli_opbase_include}")
-    endif()
-    target_include_directories(opbase_tiling_objs BEFORE PRIVATE "${qli_opbase_include}")
+set(qli_opbase_include "${OPBASE_SOURCE_PATH}/pkg_inc")
+if(NOT OPBASE_SOURCE_PATH)
+    get_filename_component(qli_opbase_include
+        "${CMAKE_CURRENT_LIST_DIR}/../../../../third_party/opbase/pkg_inc" ABSOLUTE)
 endif()
+if(TARGET opbase_tiling_objs AND NOT EXISTS "${qli_opbase_include}/op_common/atvoss/elewise/elewise_tiling.h")
+    message(FATAL_ERROR "Missing source-matched opbase tiling headers: ${qli_opbase_include}")
+endif()
+include_directories(BEFORE "${qli_opbase_include}")
 CMAKE
     dest=$(realpath -m "${QLI_INSTALL_ROOT:-$PWD/qli91-opp}")
     ( cd "$work" && bash build.sh --pkg --experimental --soc=ascend910_93 \
