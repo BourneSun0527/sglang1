@@ -24,7 +24,10 @@ from sglang.srt.hardware_backend.npu.attention.dsv4_prefill_graph import (
     Dsv4PrefillGraphMetadata,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import (
+    get_legacy_qli_prefill_ops,
+    is_npu_arch35,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -917,6 +920,8 @@ class CompressorAscendBackendMixin:
 
 
 class C4IndexerAscendBackendMixin:
+    _qli_ops = npu_indexer_ops
+
     def init_forward_metadata_indexer(self, core_attn_metadata):
         # li_quant_metadata is built in _compute_kernel_metadata; None satisfies the mixin contract
         return None
@@ -1152,7 +1157,7 @@ class C4IndexerAscendBackendMixin:
         cmp_ratio = int(c4_indexer.compressor.ratio)
         kv_len = fm.actual_seq_lengths_kv.to(torch.int32)
         seqused_k = (kv_len // cmp_ratio).to(torch.int32)
-        topk_idxs, _ = npu_indexer_ops.quant_lightning_indexer(
+        topk_idxs, _ = self._qli_ops.quant_lightning_indexer(
             q_quant,
             k,
             weights.to(q_scale.dtype),
@@ -2594,6 +2599,8 @@ class DeepseekV4AscendAttnBackend(
             self._dsv4_compress_ratios = type(hf.compress_ratios)()
         self._dsv4_has_c4 = 4 in self._dsv4_compress_ratios
         self._dsv4_has_c128 = 128 in self._dsv4_compress_ratios
+        if self._dsv4_has_c4:
+            self._qli_ops = get_legacy_qli_prefill_ops(hf) or npu_indexer_ops
         # DeepSeek-V4.1 generation signal. Both generations report KVLayout.V4
         # on NPU, so the ratios themselves are the only discriminator.
         self._dsv4_has_low_ratio = any(
@@ -4289,7 +4296,7 @@ class DeepseekV4AscendAttnBackend(
         actual_seq_lengths_q_pa: Optional[torch.Tensor],
         actual_seq_lengths_kv: torch.Tensor,
     ) -> torch.Tensor:
-        """Top-k metadata for the c4 indexer (v2 op)."""
+        """Build metadata with the same implementation as the C4 indexer."""
         cmp_ratio = 4
         kv_len = actual_seq_lengths_kv.to(torch.int32)
         if actual_seq_lengths_q_pa is not None:
@@ -4301,7 +4308,7 @@ class DeepseekV4AscendAttnBackend(
                     kv_len.cumsum(0).to(torch.int32),
                 ]
             )
-        return npu_indexer_ops.quant_lightning_indexer_metadata(
+        return self._qli_ops.quant_lightning_indexer_metadata(
             self._dsv4_index_n_heads,
             1,
             self._dsv4_index_head_dim,

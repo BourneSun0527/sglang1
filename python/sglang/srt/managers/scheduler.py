@@ -875,6 +875,11 @@ class Scheduler(
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
         if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import get_legacy_qli_prefill_ops
+
+            # Register the optional recipes bridge before select-device and HCCL init.
+            get_legacy_qli_prefill_ops(self.model_config.hf_config)
+
             # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
             # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
             from sglang.srt.dllm.config import DllmConfig

@@ -37,6 +37,27 @@ def is_npu_arch35() -> bool:
     return acl.rt.get_device_info(0, 601) == (3510, 0)
 
 
+def get_legacy_qli_prefill_ops(hf_config):
+    if not envs.SGLANG_NPU_USE_LEGACY_QLI_PREFILL.get():
+        return None
+    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.runtime_context import get_disagg
+
+    ratios = getattr(hf_config, "compress_ratios", ()) or ()
+    if (
+        get_disagg().disaggregation_mode == "prefill"
+        and is_deepseek_v4(hf_config)
+        and 4 in ratios
+        and not any(ratio in (1, 2) for ratio in ratios)
+        and not is_npu_arch35()
+    ):
+        from sglang.srt.hardware_backend.npu.dsv4 import legacy_qli
+
+        legacy_qli.load_ops()
+        return legacy_qli
+    return None
+
+
 # SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
 # SoCs report higher values and share the same capability gates.
 ASCEND_950_SOC_VERSION = 260
