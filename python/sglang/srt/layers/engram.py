@@ -1310,6 +1310,14 @@ class EngramEmbedding(nn.Module):
         storage: dict | None = None,
     ):
         super().__init__()
+        self._trace_layer = layer_id
+        self._trace_step = 0
+        self._trace_cp = (
+            os.getenv("SGLANG_DEBUG_NPU_CP_ENGRAM") == "1"
+            and is_npu()
+            and get_parallel().attn_cp_size > 1
+            and get_parallel().attn_dp_size > 1
+        )
         self.dim = dim
         self.mxfp4 = mxfp4
         self.row_bytes = _table_row_bytes(dim, mxfp4)
@@ -1470,6 +1478,21 @@ class EngramEmbedding(nn.Module):
         if self.host_table is not None:
             self.host_table.finish_load(label)
 
+    def _trace_boundary(self, stage, tensor, batch):
+        parallel = get_parallel()
+        logger.info(
+            "CP_ENGRAM layer=%d step=%d tp=%d dp=%d cp=%d mode=%s "
+            "extend_in_batch=%s stage=%s shape=%s",
+            self._trace_layer, self._trace_step, parallel.tp_rank,
+            parallel.attn_dp_rank, parallel.attn_cp_rank, batch.forward_mode,
+            batch.is_extend_in_batch, stage, tuple(tensor.shape),
+        )
+        torch.npu.current_stream().synchronize()
+        logger.info(
+            "CP_ENGRAM layer=%d step=%d tp=%d completed=%s",
+            self._trace_layer, self._trace_step, parallel.tp_rank, stage,
+        )
+
     def forward(
         self,
         indices: torch.Tensor,
@@ -1503,6 +1526,9 @@ class EngramEmbedding(nn.Module):
             and parallel.attn_cp_size > 1
             and parallel.attn_dp_size > 1
         ):
+            if self._trace_cp:
+                self._trace_step += 1
+                self._trace_boundary("entry", indices, forward_batch)
             if forward_batch.is_extend_in_batch:
                 # CP and DP padding need not describe the same physical rows.
                 # Exchange actual rank-local shapes on eager prefill, including
@@ -1513,6 +1539,8 @@ class EngramEmbedding(nn.Module):
                 torch.distributed.all_gather_object(
                     sizes, indices.shape[0], group=group.cpu_group
                 )
+                if self._trace_cp:
+                    logger.info("CP_ENGRAM tp=%d prefill_sizes=%s", parallel.tp_rank, sizes)
                 if sum(sizes) == 0:
                     return self.new_rows(indices)
                 # Use fixed-size HCCL collectives; GroupCoordinator.all_gatherv
@@ -1522,7 +1550,11 @@ class EngramEmbedding(nn.Module):
                 padded[: indices.shape[0]].copy_(indices)
                 ids = indices.new_empty((self.tp_size * rows, *indices.shape[1:]))
                 group.all_gather_into_tensor(ids, padded)
+                if self._trace_cp:
+                    self._trace_boundary("prefill_ids", ids, forward_batch)
                 values = self._lookup(ids)
+                if self._trace_cp:
+                    self._trace_boundary("prefill_values", values, forward_batch)
                 start = rows * parallel.tp_rank
                 return values[start : start + sizes[parallel.tp_rank]].contiguous()
             # CP shards hold different tokens, and each DP group holds different
@@ -1759,6 +1791,8 @@ class EngramEmbedding(nn.Module):
         dp_gather_replicate(
             ids_global, indices.clone(), forward_batch, cp_shard_counts=cp_shard_counts
         )
+        if self._trace_cp:
+            self._trace_boundary("dp_ids", ids_global, forward_batch)
         if rows == 0:
             return self.new_rows(indices)
         values = self._owned_rows(ids_global).view(rows, -1)
@@ -1771,9 +1805,12 @@ class EngramEmbedding(nn.Module):
         if is_npu() and get_parallel().attn_cp_size > 1:
             # CP prefill shards and replicated decode rows use different local
             # slices, but must share the full-TP reduction on every DP rank.
+            reduced = self._reduce_owned_rows(values)
+            if self._trace_cp:
+                self._trace_boundary("dp_values", reduced, forward_batch)
             dp_scatter(
                 local,
-                self._reduce_owned_rows(values),
+                reduced,
                 forward_batch,
                 cp_shard_counts=cp_shard_counts,
             )
@@ -1791,6 +1828,8 @@ class EngramEmbedding(nn.Module):
                 dp_reduce_scatter_tensor(local, values)
         else:
             dp_scatter(local, self._reduce_owned_rows(values), forward_batch)
+        if self._trace_cp:
+            self._trace_boundary("dp_scatter", local, forward_batch)
         return local.view(*indices.shape, self.dim)
 
 
